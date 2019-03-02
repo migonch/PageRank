@@ -1,14 +1,12 @@
-import pandas as pd
 import numpy as np
-
 import networkx as nx
-from scipy import sparse, stats
+from scipy import sparse
 from scipy.optimize import minimize_scalar
 import random
 from sklearn.preprocessing import normalize
 
 
-class PageRank():
+class PageRankGraph():
     def __init__(self, data=None):
         if type(data) == nx.classes.digraph.DiGraph:
             self.graph = data
@@ -23,25 +21,19 @@ class PageRank():
                              copy=False)
         else:
             raise TypeError('Type of data is unsuitable')
-            
 
-    def set_custom_attributes(self):
         out_degrees = np.array(list(self.graph.out_degree(range(1, self.size + 1))))[:, 1]
-        self.null_column_indeces = np.zeros(self.size)
-        self.null_column_indeces[np.where(out_degrees == 0)] = 1
-        self.P_matrix = normalize(self.adj_matrix, norm='l1').T
-        self.dataframe_of_ranks = pd.DataFrame(index=range(1, self.size + 1))
-        self.dataframe_of_ranks.index.name = 'node_id'
-        return self
-        
-    
+        self.null_column_indices = np.zeros(self.size)
+        self.null_column_indices[np.where(out_degrees == 0)] = 1
+
+        self.probability_matrix = normalize(self.adj_matrix, norm='l1').T
+
     def power_method_iteration(self, x, alpha=0.85):
-        res = alpha * self.P_matrix.dot(x)
-        res += alpha / self.size * np.dot(self.null_column_indeces, x)
+        res = alpha * self.probability_matrix.dot(x)
+        res += alpha / self.size * np.dot(self.null_column_indices, x)
         res += (1 - alpha) / self.size * np.sum(x)
         return res
-    
-    
+
     def power_method(self, x0, n_iter=200, alpha=0.85, return_residuals=False):
         assert len(x0) == self.size and abs(np.linalg.norm(x0, ord=1) - 1.0) < 1e-7
         x_cur = x0
@@ -50,53 +42,47 @@ class PageRank():
             x_next = self.power_method_iteration(x_cur, alpha=alpha)
             residuals.append(np.linalg.norm(x_next - x_cur, ord=1))
             x_cur = x_next
-        self.pm_ranks = x_cur
-        self.dataframe_of_ranks['Power Method'] = self.pm_ranks 
-        if not return_residuals: residuals = None
+
+        if not return_residuals:
+            residuals = None
+
         return x_cur, residuals
-    
-    
+
     def mcmc(self, n_iter=int(1e6), alpha=0.85):
-        self.mcmc_ranks = np.zeros(self.size)
-        self.mcmc_deviations = []
+        mcmc_ranks = np.zeros(self.size)
         list_of_nodes = list(self.graph.nodes())
-        rv = stats.bernoulli(1 - alpha)
-        # sequence of 0 and 1
-        # 1's numbers = numbers of steps with teleport
-        teleports = rv.rvs(size=n_iter)
+        teleports = np.random.binomial(n=1, p=1-alpha, size=n_iter)  # 0-1 sequence, 1 means teleport
         # start to surf
         node = random.choice(list_of_nodes)
-        for i in range(len(teleports)):
+        for i in range(n_iter):
             if teleports[i] or list(self.graph.successors(node)) == []:
                 node = random.choice(list_of_nodes)
             else:
                 node = random.choice(list(self.graph.successors(node)))
-            self.mcmc_ranks[node - 1] += 1
-            if (i + 1) % 100 == 0:
-                self.mcmc_deviations.append(np.linalg.norm(self.mcmc_ranks / (i + 1) - self.pm_ranks))
-        self.mcmc_ranks /= n_iter
-        self.dataframe_of_ranks['MCMC'] = self.mcmc_ranks
-        return self
-    
-    
+            mcmc_ranks[node - 1] += 1
+        return mcmc_ranks / n_iter
+
     def frank_wolfe_iteration(self, x, k, step='line_search', alpha=0.85):
-        Ax = alpha * (self.P_matrix.dot(x) + np.dot(self.null_column_indeces, x) / self.size) 
-        Ax += (1 - alpha) / self.size - x # Ax
-        grad = alpha * self.P_matrix.T.dot(Ax) - Ax # A^TAx
+        Ax = alpha * self.probability_matrix.dot(x) + alpha / self.size * np.dot(self.null_column_indices, x)
+        Ax += (1 - alpha) / self.size * np.sum(x) - x
+
+        grad = alpha * self.probability_matrix.T.dot(Ax) + alpha / self.size * np.sum(Ax) * self.null_column_indices
+        grad += (1 - alpha) / self.size * np.sum(Ax) - Ax
+
         y = np.zeros(self.size)
-        y[grad.argmin()] = 1 # y_k
-        Ay = alpha * (self.P_matrix.dot(y) + 
-                      self.null_column_indeces[grad.argmin()] / self.size) 
+        y[grad.argmin()] = 1
+
+        Ay = alpha * (self.probability_matrix.dot(y) + self.null_column_indices[grad.argmin()] / self.size)
         Ay += (1 - alpha) / self.size - y
+
         if step == 'line_search':
-            gamma = minimize_scalar(lambda gam: np.linalg.norm((1 - gam) * Ax + gam * Ay) ** 2 / 2, 
-                                    bounds=(0, 1)).x
+            gamma = minimize_scalar(lambda gam: np.linalg.norm((1 - gam) * Ax + gam * Ay) ** 2, bounds=(0, 1)).x
         elif step == 'nonadaptive':
             gamma = 2 / (k + 2)
         else:
             raise ValueError("step must be 'line_search' or 'nonadaptive'")
-        return x + gamma * (y - x), np.linalg.norm(Ax) ** 2 / 2 # x_{k+1}
-    
+
+        return x + gamma * (y - x), np.linalg.norm(Ax) ** 2 / 2
     
     def frank_wolfe(self, x0, n_iter, step='line_search', alpha=0.85, 
                     return_targets=False, return_residuals=False):
@@ -109,13 +95,11 @@ class PageRank():
             targets.append(target_cur)
             residuals.append(np.linalg.norm(x_next - x_cur, ord=1))
             x_cur = x_next
-        self.fw_ranks = x_cur
-        self.dataframe_of_ranks['Frank-Wolfe'] = self.fw_ranks
-        if not return_targets: targets = None
-        if not return_residuals: residuals = None
+
+        if not return_targets:
+            targets = None
+
+        if not return_residuals:
+            residuals = None
+
         return x_cur, targets, residuals
-    
-    
-    def show_ranks(self, n_first=5, sort_by='Power Method'):
-        return self.dataframe_of_ranks.sort_values(by=sort_by, 
-                                                   ascending=False).head(n_first)
